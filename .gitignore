@@ -1,0 +1,34 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Datasets and processed files (Large files)
+data/
+*.npy
+*.nii.gz
+*.tar
+
+# Model checkpoints and weights
+checkpoints/
+*.pth
+*.pt
+
+# Outputs and results
+results/
+exported_models/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE configurations
+.vscode/
+.idea/
