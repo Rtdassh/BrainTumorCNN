@@ -62,6 +62,15 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
         if any(len(indices) > 0 for indices in needed_slices.values()):
             img_data = img_nii.get_fdata(dtype=np.float32) # Decompress once in memory (fast!)
             
+            # Normalize the 3D volume per modality/channel to preserve relative contrast across slices
+            for mod_idx in [0, 2, 3]:
+                vol = img_data[:, :, :, mod_idx]
+                vol_min, vol_max = vol.min(), vol.max()
+                if vol_max > vol_min:
+                    img_data[:, :, :, mod_idx] = (vol - vol_min) / (vol_max - vol_min)
+                else:
+                    img_data[:, :, :, mod_idx] = 0.0
+            
             for cls, z_indices in needed_slices.items():
                 for z in z_indices:
                     img_slice = img_data[:, :, z, :]
@@ -73,15 +82,8 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
                         continue # Skip slices with almost no brain tissue
                         
                     # Prepare 3-channel input: FLAIR (0), T1gd (2), T2w (3)
-                    channels = []
-                    for mod_idx in [0, 2, 3]:
-                        ch = img_slice[:, :, mod_idx]
-                        ch_min, ch_max = ch.min(), ch.max()
-                        if ch_max > ch_min:
-                            ch = (ch - ch_min) / (ch_max - ch_min)
-                        else:
-                            ch = np.zeros_like(ch)
-                        channels.append(ch)
+                    # Since volume is already normalized, we extract channels directly
+                    channels = [img_slice[:, :, mod_idx] for mod_idx in [0, 2, 3]]
                         
                     # Stack to form (3, H, W)
                     slice_3ch = np.stack(channels, axis=0).astype(np.float32)

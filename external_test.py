@@ -36,14 +36,14 @@ class ExternalTestDataset(torch.utils.data.Dataset):
         # Load image as grayscale
         img = Image.open(img_path).convert('L')
         
-        # We need to output a 3-channel tensor of size 240x240
+        # We need to output a 3-channel tensor of size 128x128
         # Replicating the grayscale channel across all 3 channels
         if self.transform:
             img_tensor = self.transform(img)
         else:
             # Default transform if none specified
             default_tf = T.Compose([
-                T.Resize((240, 240)),
+                T.Resize((128, 128)),
                 T.ToTensor(),
             ])
             img_tensor = default_tf(img)
@@ -95,7 +95,7 @@ def main():
     
     # Dataset preparation
     transform = T.Compose([
-        T.Resize((240, 240)),
+        T.Resize((128, 128)),
         T.ToTensor(),
     ])
     

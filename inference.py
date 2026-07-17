@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import nibabel as nib
 import matplotlib.pyplot as plt
+import torchvision.transforms.functional as TF
 from model import get_model, BrainTumorEnsemble
 
 class BrainTumorInference:
@@ -32,23 +33,29 @@ class BrainTumorInference:
         else:
             self.model = self.models[0]
             
-    def predict_slice(self, flair, t1gd, t2w):
+    def predict_slice(self, flair, t1gd, t2w, pre_normalized=False):
         """
         Predicts the class of a single 2D axial slice.
         Channels: FLAIR, T1gd, T2w.
         """
-        # Normalize each channel individually to [0, 1]
-        channels = []
-        for ch in [flair, t1gd, t2w]:
-            ch_min, ch_max = ch.min(), ch.max()
-            if ch_max > ch_min:
-                ch = (ch - ch_min) / (ch_max - ch_min)
-            else:
-                ch = np.zeros_like(ch)
-            channels.append(ch)
+        if pre_normalized:
+            slice_3ch = np.stack([flair, t1gd, t2w], axis=0).astype(np.float32)
+        else:
+            # Normalize each channel individually to [0, 1]
+            channels = []
+            for ch in [flair, t1gd, t2w]:
+                ch_min, ch_max = ch.min(), ch.max()
+                if ch_max > ch_min:
+                    ch = (ch - ch_min) / (ch_max - ch_min)
+                else:
+                    ch = np.zeros_like(ch)
+                channels.append(ch)
+            slice_3ch = np.stack(channels, axis=0).astype(np.float32)
             
-        slice_3ch = np.stack(channels, axis=0).astype(np.float32)
-        input_tensor = torch.tensor(slice_3ch).unsqueeze(0).to(self.device) # (1, 3, H, W)
+        input_tensor = torch.tensor(slice_3ch)
+        # Resize slice to 128x128 to match model training resolution
+        input_tensor = TF.resize(input_tensor, [128, 128])
+        input_tensor = input_tensor.unsqueeze(0).to(self.device) # (1, 3, H, W)
         
         with torch.no_grad():
             outputs = self.model(input_tensor)
@@ -70,8 +77,17 @@ class BrainTumorInference:
         and returns slice indices, predicted classes, and probabilities.
         """
         img_nii = nib.load(nifti_image_path)
-        img_data = img_nii.get_fdata() # Shape: (H, W, D, 4)
+        img_data = img_nii.get_fdata(dtype=np.float32) # Shape: (H, W, D, 4)
         
+        # Normalize the 3D volume per modality/channel to preserve relative contrast across slices
+        for mod_idx in [0, 2, 3]:
+            vol = img_data[:, :, :, mod_idx]
+            vol_min, vol_max = vol.min(), vol.max()
+            if vol_max > vol_min:
+                img_data[:, :, :, mod_idx] = (vol - vol_min) / (vol_max - vol_min)
+            else:
+                img_data[:, :, :, mod_idx] = 0.0
+                
         h, w, d = img_data.shape[:3]
         
         predictions = []
@@ -91,7 +107,7 @@ class BrainTumorInference:
                 slice_indices.append(z)
                 continue
                 
-            pred_cls, probs = self.predict_slice(flair, t1gd, t2w)
+            pred_cls, probs = self.predict_slice(flair, t1gd, t2w, pre_normalized=True)
             predictions.append(pred_cls)
             probabilities.append(probs)
             slice_indices.append(z)

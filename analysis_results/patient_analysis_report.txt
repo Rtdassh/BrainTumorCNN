@@ -1,0 +1,87 @@
+======================================================================
+             CLINICAL BRAIN TUMOR MODEL ANALYSIS REPORT               
+======================================================================
+
+Checkpoint evaluated: c:/Users/JDan/Documents/NeuroMatch/Dataset/best_model/best_model_fold_1.pth
+Total Validation Patients: 97
+Total Validation Slices: 1367
+
+----------------------------------------------------------------------
+ 1. SLICE-LEVEL DIAGNOSTIC SUMMARY
+----------------------------------------------------------------------
+Overall Slice Accuracy: 0.7959
+Overall Slice Macro F1: 0.7583
+
+Detailed Classification Report:
+                     precision    recall  f1-score   support
+
+         Healthy/Bg       1.00      1.00      1.00       273
+              Edema       0.73      0.85      0.79       435
+Non-Enhancing Tumor       0.44      0.39      0.41       189
+    Enhancing Tumor       0.89      0.79      0.84       470
+
+           accuracy                           0.80      1367
+          macro avg       0.76      0.76      0.76      1367
+       weighted avg       0.80      0.80      0.79      1367
+
+----------------------------------------------------------------------
+ 2. PATIENT-LEVEL AGGREGATION DIAGNOSTIC SUMMARY
+----------------------------------------------------------------------
+Clinically, 2D slice predictions are aggregated to make a single diagnosis
+decision for the patient.
+
+Method A: Majority Voting among slice predictions
+  - Patient-Level Accuracy: 0.2577
+  - Patient-Level Macro F1: 0.2011
+
+Method B: Average Probabilities across slices (Recommended)
+  - Patient-Level Accuracy: 0.3918
+  - Patient-Level Macro F1: 0.2027
+
+Patient-Level Classification Report (Average Probabilities):
+                     precision    recall  f1-score   support
+
+         Healthy/Bg       0.00      0.00      0.00         0
+              Edema       0.00      0.00      0.00         0
+Non-Enhancing Tumor       0.17      0.50      0.25         2
+    Enhancing Tumor       1.00      0.39      0.56        95
+
+           accuracy                           0.39        97
+          macro avg       0.29      0.22      0.20        97
+       weighted avg       0.98      0.39      0.55        97
+
+----------------------------------------------------------------------
+ 3. CLINICAL SUBPOPULATION ANALYSIS (COHORT BIAS / ROBUSTNESS)
+----------------------------------------------------------------------
+Performance breakdown across different MRI scanners and clinical cohorts:
+
+Center A (GBM study 1):
+  Patients: 47 | Slices: 684
+  Slice Accuracy: 0.7675 | Slice Macro F1: 0.7593
+
+Center B (GBM study 2):
+  Patients: 14 | Slices: 206
+  Slice Accuracy: 0.7136 | Slice Macro F1: 0.7268
+
+Center C (LGG/Other study):
+  Patients: 36 | Slices: 477
+  Slice Accuracy: 0.8721 | Slice Macro F1: 0.6975
+
+----------------------------------------------------------------------
+ 4. HARDEST PATIENTS (LOWEST ACCURACY CASES)
+----------------------------------------------------------------------
+These patients have the lowest percentage of correct slice predictions,
+suggesting challenging boundary conditions or atypical imaging features:
+
+Patient ID      Center                    Slices   Accuracy   True                 Predicted (Prob)    
+---------------------------------------------------------------------------------------------------------
+BRATS_042       Center A (GBM study 1)    17       0.3529     Enhancing Tumor      Edema               
+BRATS_025       Center A (GBM study 1)    5        0.4000     Non-Enhancing Tumor  Edema               
+BRATS_143       Center A (GBM study 1)    10       0.4000     Enhancing Tumor      Enhancing Tumor     
+BRATS_116       Center A (GBM study 1)    16       0.4375     Enhancing Tumor      Non-Enhancing Tumor 
+BRATS_028       Center A (GBM study 1)    10       0.5000     Enhancing Tumor      Enhancing Tumor     
+BRATS_265       Center B (GBM study 2)    10       0.5000     Enhancing Tumor      Edema               
+BRATS_092       Center A (GBM study 1)    15       0.5333     Enhancing Tumor      Edema               
+BRATS_032       Center A (GBM study 1)    16       0.5625     Enhancing Tumor      Edema               
+BRATS_104       Center A (GBM study 1)    17       0.5882     Enhancing Tumor      Enhancing Tumor     
+BRATS_117       Center A (GBM study 1)    15       0.6000     Enhancing Tumor      Non-Enhancing Tumor 

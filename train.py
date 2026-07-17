@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import classification_report, f1_score, roc_auc_score
@@ -15,9 +16,11 @@ from crossval import get_patient_folds
 
 # Custom Dataset
 class BrainTumorSliceDataset(torch.utils.data.Dataset):
-    def __init__(self, patient_list, processed_dir, transform=None):
+    def __init__(self, patient_list, processed_dir, transform=None, cache=True, image_size=128):
         self.processed_dir = processed_dir
         self.transform = transform
+        self.cache = cache
+        self.image_size = image_size
         self.samples = []
         
         # Load metadata
@@ -34,14 +37,31 @@ class BrainTumorSliceDataset(torch.utils.data.Dataset):
                         if os.path.exists(slice_path):
                             self.samples.append((slice_path, cls))
                             
+        # Cache samples in memory if enabled
+        if self.cache:
+            print(f"Caching {len(self.samples)} samples in memory (resized to {self.image_size}x{self.image_size})...")
+            self.cached_images = []
+            for slice_path, _ in tqdm(self.samples, desc="Caching dataset", leave=False):
+                image = np.load(slice_path)
+                image_tensor = torch.tensor(image, dtype=torch.float32)
+                if self.image_size is not None:
+                    image_tensor = TF.resize(image_tensor, [self.image_size, self.image_size])
+                self.cached_images.append(image_tensor)
+                
     def __len__(self):
         return len(self.samples)
         
     def __getitem__(self, idx):
         slice_path, label = self.samples[idx]
-        image = np.load(slice_path)
-        image = torch.tensor(image, dtype=torch.float32)
         
+        if self.cache:
+            image = self.cached_images[idx].clone() # Clone to avoid modifying cache in-place
+        else:
+            image = np.load(slice_path)
+            image = torch.tensor(image, dtype=torch.float32)
+            if self.image_size is not None:
+                image = TF.resize(image, [self.image_size, self.image_size])
+            
         if self.transform:
             image = self.transform(image)
             
@@ -53,6 +73,20 @@ class RandomAddNoise:
         self.std = std
     def __call__(self, tensor):
         return tensor + torch.randn_like(tensor) * self.std
+
+class RandomModalityReplicate:
+    """
+    Randomly (with probability p) selects one of the 3 channels (FLAIR, T1gd, T2w)
+    and replicates it across all 3 channels to simulate single-channel sequence inputs.
+    This helps the model generalize to single-sequence grayscale images (like external test sets).
+    """
+    def __init__(self, p=0.3):
+        self.p = p
+    def __call__(self, tensor):
+        if torch.rand(1).item() < self.p:
+            idx = torch.randint(0, 3, (1,)).item()
+            return tensor[idx:idx+1].repeat(3, 1, 1)
+        return tensor
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
@@ -119,7 +153,7 @@ def validate(model, loader, criterion, device):
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet-18 on Brain Tumor Slices")
     parser.add_argument("--fold", type=int, default=1, help="Which fold to train (1-5)")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
@@ -150,6 +184,8 @@ def main():
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
         T.RandomRotation(degrees=15),
+        T.ColorJitter(brightness=0.15, contrast=0.15),
+        RandomModalityReplicate(p=0.3),
     ])
     
     # Create datasets
