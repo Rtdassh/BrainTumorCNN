@@ -1,114 +1,142 @@
 # Brain Tumor CNN Classification Project
 
-Este proyecto implementa un sistema robusto de clasificación de tumores cerebrales en 4 clases a partir de cortes de resonancia magnética (MRI) 2D axiales, utilizando el dataset **Task01_BrainTumour (BraTS)** de MONAI.
+This project implements a robust system for 4-class brain tumor classification from 2D axial magnetic resonance imaging (MRI) slices, using the MONAI **Task01_BrainTumour (BraTS)** dataset.
 
-La arquitectura se basa en una red **ResNet-18** pre-entrenada, y la metodología de entrenamiento incorpora buenas prácticas del artículo *"Deep Learning–based Identification of Brain MRI Sequences"* (2023) para garantizar la solidez ante la variabilidad de escáneres y la correcta validación sin fugas de datos.
-
----
-
-## 🛠️ Estructura del Proyecto
-
-El código está estructurado de la siguiente forma:
-
-- **`requirements.txt`**: Listado de dependencias necesarias.
-- **`setup_env.ps1`** / **`setup_env.sh`**: Scripts de configuración de entorno para Windows y Linux/Colab.
-- **`preprocess_data.py`**: Convierte los volúmenes 3D en rodajas (*slices*) axiales 2D de 3 canales (FLAIR, T1gd, T2w) y las clasifica.
-- **`model.py`**: Define la arquitectura ResNet-18 y el soporte para ensambles de múltiples modelos.
-- **`crossval.py`**: Divide a los pacientes utilizando una estrategia de **K-Fold Estratificado por paciente** para evitar fugas de datos.
-- **`train.py`**: Script de entrenamiento principal con balanceo de clases, aumentación y registro (soporta Weights & Biases).
-- **`evaluate.py`**: Evalúa los modelos entrenados, genera matrices de confusión, curvas ROC/PR, análisis de robustez por centro y mapas **Grad-CAM**.
-- **`inference.py`**: Ejecuta predicciones sobre nuevos volúmenes NIfTI 3D y genera perfiles de probabilidad a lo largo del eje axial.
-- **`external_test.py`**: Valida el modelo frente a un dataset externo independiente de imágenes 2D (`brain_tumor_dataset`).
-- **`hanging_protocol_integration.py`**: Demostración de integración clínica PACS/Hanging Protocol basada en las predicciones.
+The architecture is built upon a pre-trained **ResNet-18** network (with factory options for **EfficientNet-B0** and **ResNet-34**), and the training methodology incorporates best practices from the research paper *"Deep Learning–based Identification of Brain MRI Sequences"* (2023) to ensure robustness against scanner variability and strict data validation without data leakage.
 
 ---
 
-## 🚀 Guía de Uso Paso a Paso
+## 🛠️ Project Structure
 
-### 1. Preparar el Entorno
+The repository is organized as follows:
 
-En Windows (PowerShell):
+- **`requirements.txt`**: List of required Python dependencies.
+- **`setup_env.ps1`** / **`setup_env.sh`**: Environment setup scripts for Windows and Linux/Colab.
+- **`preprocess_data.py`**: Converts 3D NIfTI volumes into 3-channel 2D axial slices (FLAIR, T1gd, T2w) and categorizes them by target class.
+- **`model.py`**: Defines the neural network architectures (ResNet-18, EfficientNet-B0, ResNet-34), hybrid pooling, and multi-model ensembling.
+- **`crossval.py`**: Splits patients using a **Patient-Stratified K-Fold** strategy to strictly prevent data leakage.
+- **`train.py`**: Main training script featuring class-weighted loss, custom data augmentations, and Weights & Biases logging.
+- **`evaluate.py`**: Evaluates trained fold models, generates confusion matrices, ROC/PR curves, per-center scanner robustness analysis, and **Grad-CAM** saliency maps.
+- **`inference.py`**: Runs inference on new 3D NIfTI volumes and generates axial slice probability evolution profiles.
+- **`external_test.py`**: Validates the model against an independent external 2D image dataset (`brain_tumor_dataset`).
+- **`hanging_protocol_integration.py`**: Clinical PACS / Hanging Protocol integration demo based on automated model predictions.
+
+---
+
+## 🧠 Neural Network Architecture & Structural Options
+
+The model architecture is optimized for multi-sequence feature extraction from magnetic resonance imaging (MRI):
+
+### 1. Current Network Structure
+* **Input**: 3-channel 2D axial slices `(FLAIR, T1gd, T2w)` resized to $240 \times 240$ or $128 \times 128$.
+* **Feature Extractor**: **ResNet-18** pre-trained on ImageNet (captures transferrable morphological and contrast patterns).
+* **Pooling**: Global Average Pooling (GAP) with optional **Dual/Hybrid Global Pooling (GAP + GMP)** to capture both broad diffuse regions (edema) and small high-intensity focal points (enhancing tumor core).
+* **Classification Head**: 2-layer dense Multi-Layer Perceptron (MLP) with Batch Normalization and Dropout:
+  $$\text{Input} \xrightarrow{\text{Linear(in, 256)}} \text{BatchNorm1d} \xrightarrow{\text{ReLU}} \text{Dropout}(p=0.2) \xrightarrow{\text{Linear(256, 4)}} \text{Logits}$$
+* **Ensemble Support (`BrainTumorEnsemble`)**: Combines predictions across multiple fold models by averaging softmax probability vectors $\sigma(z)$, enhancing clinical stability and calibration.
+* **Layer-wise Learning Rate Decay (LLRD)**: Exposed via `get_parameter_groups()`, applying decay multipliers to initial convolutional layers to preserve pre-trained ImageNet features while adapting the head to the MRI domain.
+
+### 2. Configurable Improvement Options
+
+1. **Flexible Backbone Selection (`get_model`)**:
+   - `resnet18` (Default): Lightweight (~11.2M parameters), fast execution, resistant to overfitting.
+   - `resnet34`: Deeper convolutional capacity for complex feature representations.
+   - `efficientnet_b0`: Features depthwise separable convolutions and built-in Squeeze-and-Excitation (SE) channel attention blocks (~5.3M parameters).
+2. **Channel-wise Attention (Squeeze-and-Excitation)**:
+   - Dynamically re-weights input sequence channels (FLAIR vs. T1gd vs. T2w) based on the tissue type present in the slice (e.g., boosting FLAIR for Edema, T1gd for Enhancing core).
+3. **2.5D Spatial Context (Adjacent Slice Stacking)**:
+   - Expand input channels from 3 to 9 `[z-1, z, z+1]` to supply vertical spatial continuity along the z-axis.
+4. **Head Regularization & Normalization**:
+   - Internal activation normalization via `BatchNorm1d` combined with $20\%$ `Dropout` to balance domain adaptation without underfitting.
+
+---
+
+## 🚀 Step-by-Step Usage Guide
+
+### 1. Environment Setup
+
+On Windows (PowerShell):
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup_env.ps1
 ```
 
-En Linux / Google Colab / macOS (Bash):
+On Linux / Google Colab / macOS (Bash):
 ```bash
 chmod +x setup_env.sh
 ./setup_env.sh
 ```
 
-### 2. Preprocesar los Datos
+### 2. Data Preprocessing
 
-El preprocesamiento carga los archivos `.nii.gz` 3D, filtra las zonas sin tejido cerebral relevante y extrae cortes axiales 2D que contienen las clases:
-- **Clase 0**: Sano / Fondo (Healthy/Bg)
-- **Clase 1**: Edema (Edema)
-- **Clase 2**: Tumor no realzado (Non-enhancing tumor)
-- **Clase 3**: Tumor realzado (Enhancing tumor)
+Preprocessing loads 3D `.nii.gz` files, filters out non-brain background regions, and extracts 2D axial slices containing the target target classes:
+- **Class 0**: Healthy / Background (Healthy/Bg)
+- **Class 1**: Edema (Edema)
+- **Class 2**: Non-enhancing tumor (Non-enhancing tumor)
+- **Class 3**: Enhancing tumor (Enhancing tumor)
 
-Para ejecutar el preprocesamiento:
+To execute preprocessing:
 ```bash
-# Activar entorno virtual si es necesario: .\venv\Scripts\activate o source venv/bin/activate
+# Activate virtual environment if necessary: .\venv\Scripts\activate or source venv/bin/activate
 python preprocess_data.py
 ```
-Esto creará una carpeta en `data/processed_2d/` separando las rodajas por carpetas de clase y guardando un archivo `metadata.json` con la distribución por pacientes.
+This generates `data/processed_2d/` organizing slices by class subfolders and creating `metadata.json` with patient distributions.
 
-### 3. Entrenar el Modelo (con Cross-Validation)
+### 3. Model Training (with Cross-Validation)
 
-Para entrenar el modelo en el Fold 1 (por defecto se ejecutan 15 épocas):
+To train the model on Fold 1 (default: 15 epochs):
 ```bash
 python train.py --fold 1 --epochs 15 --batch_size 32
 ```
-Puedes usar opciones adicionales como:
-- `--device cpu` o `--device cuda`
-- `--wandb` para activar el registro en Weights & Biases.
-- Cambiar el fold con `--fold 2` hasta `--fold 5`.
+Optional flags:
+- `--device cpu` or `--device cuda`
+- `--wandb` to enable real-time experiment tracking on Weights & Biases.
+- `--fold 2` through `--fold 5` to train alternate cross-validation folds.
 
-Los checkpoints del mejor modelo basado en F1-Macro de validación se guardarán en la carpeta `checkpoints/`.
+Best model checkpoints based on validation Macro F1 score are automatically saved to `checkpoints/`.
 
-### 4. Evaluación Completa y Grad-CAM
+### 4. Full Evaluation & Grad-CAM Visualization
 
-Una vez entrenado el modelo para un fold, evalúa su rendimiento global y por centro clínico simulado (basado en el paper):
+After training a fold model, evaluate its overall performance and simulated clinical center breakdown:
 ```bash
 python evaluate.py --fold 1
 ```
-Este script producirá en la carpeta `results/`:
-1. **`confusion_matrix.png`**: Matriz de confusión detallada.
-2. **`roc_curves.png`** y **`precision_recall_curves.png`**: Rendimiento ROC y PR por clase.
-3. **`gradcam_samples.png`**: Explicabilidad visual **Grad-CAM** superpuesta sobre el canal FLAIR, localizando las áreas que la red considera clave para su decisión.
-4. **Análisis de Robustez por Centro**: Desglose de precisión y F1 por subestudios/escáneres de origen.
+This generates the following artifacts in `results/`:
+1. **`confusion_matrix.png`**: Detailed confusion matrix.
+2. **`roc_curves.png`** and **`precision_recall_curves.png`**: Class-wise ROC and Precision-Recall performance curves.
+3. **`gradcam_samples.png`**: Visual **Grad-CAM** saliency maps overlaid on the FLAIR sequence, highlighting decision-critical regions.
+4. **Scanner Center Robustness Analysis**: Detailed Accuracy and Macro F1 breakdowns by origin scanner study.
 
-### 5. Inferencia en Nuevos Volúmenes 3D
+### 5. Inference on New 3D NIfTI Volumes
 
-Para clasificar cada corte axial de un paciente completo y ver su perfil de evolución a lo largo del cerebro:
+To classify all axial slices of a full 3D patient volume and plot probability evolution along the axial axis:
 ```bash
 python inference.py --image_path data/Task01_BrainTumour/imagesTr/BRATS_001.nii.gz --folds 1
 ```
-*(Puedes pasar múltiples folds separados por comas para usar un **Ensemble** de predicción, p. ej. `--folds 1,2,3`)*
+*(Pass multiple comma-separated folds to use a prediction **Ensemble**, e.g., `--folds 1,2,3`)*
 
-Esto guardará un gráfico de perfil de probabilidad `results/volume_prediction_profile.png` que ayuda al radiólogo a ver en qué coordenadas axiales se localiza cada componente tumoral.
+This saves a profile chart to `results/volume_prediction_profile.png`, enabling radiologists to pinpoint axial tumor slice distributions.
 
-### 6. Validación Externa (Generalización)
+### 6. External Validation (Generalization Test)
 
-Valida la robustez y capacidad de generalización del modelo frente al dataset 2D externo (`brain_tumor_dataset`):
+Validate model generalization against an independent external 2D image dataset (`brain_tumor_dataset`):
 ```bash
 python external_test.py --folds 1
 ```
-Este script mapea las predicciones de 4 clases a una clasificación binaria (Sano vs Tumor) y evalúa la **Sensibilidad** y **Especificidad** en imágenes reales no provenientes de la distribución de BraTS. Guarda el reporte en `results/external_test_report.txt`.
+This script maps 4-class predictions into a binary classification (Healthy vs. Tumor) and measures **Sensitivity** and **Specificity** on non-BraTS distribution images. Results are saved to `results/external_test_report.txt`.
 
-### 7. Integración Clínica (Hanging Protocol)
+### 7. Clinical Integration (Hanging Protocol)
 
-Simula un sistema PACS clínico que organiza de manera inteligente los monitores del especialista a partir de los hallazgos automáticos del modelo:
+Simulates a clinical PACS system that intelligently arranges specialist displays based on automated model findings:
 ```bash
 python hanging_protocol_integration.py --image_path data/Task01_BrainTumour/imagesTr/BRATS_001.nii.gz --folds 1
 ```
-Generará un archivo JSON de configuración de visualización `results/hanging_protocol_config.json` especificando qué secuencia colocar en cada monitor, en qué cortes enfocar la vista y el nivel de zoom idóneo.
+Generates a PACS display configuration `results/hanging_protocol_config.json` detailing monitor sequence assignments, focus slices, and initial zoom levels.
 
 ---
 
-## 📊 Buenas Prácticas del Artículo Incorporadas
+## 📊 Paper Best Practices Incorporated
 
-1. **Manejo de Variabilidad de Escáneres (Scanner/Center Analysis)**: Evaluamos y desglosamos las métricas por centros independientes para detectar posibles pérdidas de generalización debido al fabricante del escáner.
-2. **K-Fold Estratificado por Paciente**: Se evita rigurosamente cualquier fuga de datos (data leakage) asegurando que ninguna rodaja de un paciente de validación se use en el entrenamiento.
-3. **Normalización por Canales**: Cada secuencia (FLAIR, T1gd, T2w) se escala independientemente de 0 a 1 por rodaja, minimizando el impacto del contraste relativo entre distintas máquinas.
-4. **Pérdida Balanceada (Weighted Cross Entropy)**: Ajustamos el gradiente según la frecuencia de clases para compensar el desbalance natural de las áreas de tumor en el cerebro.
+1. **Scanner Cohort Variability Handling**: Evaluates and breaks down performance across independent center cohorts to detect scanner domain shift.
+2. **Patient-Stratified K-Fold Validation**: Strictly prevents data leakage by ensuring no slice from a validation patient is present in the training set.
+3. **Per-Channel Min-Max Normalization**: Scales each modality (FLAIR, T1gd, T2w) independently to $[0, 1]$ per slice to reduce relative contrast variance between scanners.
+4. **Class-Weighted Cross Entropy Loss**: Adjusts gradients based on training set class frequencies to handle tumor region class imbalances.

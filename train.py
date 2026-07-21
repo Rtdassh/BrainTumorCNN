@@ -219,22 +219,14 @@ def main():
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
         T.RandomRotation(degrees=15, interpolation=T.InterpolationMode.BILINEAR),
-        # --- Intensity / MRI-specific ---
-        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.1),
-        # RandomBiasField(strength=0.15), # Disabled: too distorting for early training
-        # RandomAddNoise(std=0.03),       # Disabled: too distorting
-        # --- Structural dropout ---
-        T.RandomErasing(p=0.1, scale=(0.02, 0.10), ratio=(0.3, 3.3), value=0),
         # --- Modality simulation ---
         RandomModalityReplicate(p=0.3),
-        # --- ImageNet normalization (MUST be last) ---
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        # NOTE: ImageNet Normalization removed. It shifts the 0-background to -2.11,
+        # creating artificial boundaries when ResNet applies zero-padding.
     ])
 
-    # Validation: only normalize — no augmentation.
-    val_transform = T.Compose([
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+    # Validation: no augmentation.
+    val_transform = None
 
     # Create datasets
     train_dataset = BrainTumorSliceDataset(train_patients, processed_dir, transform=train_transform)
@@ -267,8 +259,8 @@ def main():
     print(f"Calculated class weights: {class_weights}")
     
     weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
-    # label_smoothing=0.1 prevents overconfident predictions and improves calibration.
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=0.1)
+    # Reverted label_smoothing.
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
     # Initialize model
     model = get_model(num_classes=4, pretrained=True).to(args.device)
