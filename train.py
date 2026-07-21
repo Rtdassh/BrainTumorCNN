@@ -218,13 +218,13 @@ def main():
         # --- Geometric ---
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-        T.RandomRotation(degrees=20, interpolation=T.InterpolationMode.BILINEAR),
+        T.RandomRotation(degrees=15, interpolation=T.InterpolationMode.BILINEAR),
         # --- Intensity / MRI-specific ---
-        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.3),
-        RandomBiasField(strength=0.15),
-        RandomAddNoise(std=0.03),
+        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.1),
+        # RandomBiasField(strength=0.15), # Disabled: too distorting for early training
+        # RandomAddNoise(std=0.03),       # Disabled: too distorting
         # --- Structural dropout ---
-        T.RandomErasing(p=0.2, scale=(0.02, 0.10), ratio=(0.3, 3.3), value=0),
+        T.RandomErasing(p=0.1, scale=(0.02, 0.10), ratio=(0.3, 3.3), value=0),
         # --- Modality simulation ---
         RandomModalityReplicate(p=0.3),
         # --- ImageNet normalization (MUST be last) ---
@@ -273,35 +273,13 @@ def main():
     # Initialize model
     model = get_model(num_classes=4, pretrained=True).to(args.device)
 
-    # ── Two-Stage Fine-Tuning with LLRD ───────────────────────────────────────
-    # Stage 1 (epochs 1..WARMUP_FREEZE_EPOCHS):
-    #   Backbone is FROZEN. Only the new classification head is trained at a
-    #   high LR (1e-3). This lets the head stabilize before the pretrained
-    #   backbone weights are touched.
-    #
-    # Stage 2 (epochs WARMUP_FREEZE_EPOCHS+1..end):
-    #   All layers are unfrozen with LLRD:
-    #     - Head:   args.lr        (highest — newly initialized)
-    #     - layer4: 0.1  × args.lr (fine-tune last residual block)
-    #     - layer3: 0.05 × args.lr
-    #     - layer2: 0.02 × args.lr
-    #     - stem:   0.01 × args.lr (preserve early feature detectors)
-    WARMUP_FREEZE_EPOCHS = 5
-
-    # Start with backbone frozen
-    for name, param in model.named_parameters():
-        if 'fc' not in name:
-            param.requires_grad = False
-
-    head_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(head_params, lr=1e-3, weight_decay=1e-4)
-
-    # Cosine annealing over the full training run (restarts are handled by the epoch logic)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - WARMUP_FREEZE_EPOCHS, eta_min=1e-6
-    )
-
-    print(f"Stage 1: Training head only for {WARMUP_FREEZE_EPOCHS} epochs (backbone frozen).")
+    # ── Optimizer and Scheduler ───────────────────────────────────────────────
+    # We use a single learning rate for the whole model.
+    # Since MRI modalities (FLAIR, T1gd, T2w) are very different from RGB 
+    # natural images, the early layers (stem) MUST be able to adapt their 
+    # weights significantly. Freezing them hurts transfer learning for MRIs.
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
     # Optional W&B logger setup
     if args.wandb:
@@ -320,25 +298,10 @@ def main():
     best_val_f1 = 0.0
     
     for epoch in range(1, args.epochs + 1):
-        # ── Stage transition: unfreeze backbone at epoch WARMUP_FREEZE_EPOCHS+1 ──
-        if epoch == WARMUP_FREEZE_EPOCHS + 1:
-            print(f"\nStage 2: Unfreezing all layers with LLRD (base_lr={args.lr}).")
-            for param in model.parameters():
-                param.requires_grad = True
-            param_groups = model.get_parameter_groups(base_lr=args.lr)
-            optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
-            # Re-initialise scheduler for the remaining epochs
-            remaining = args.epochs - WARMUP_FREEZE_EPOCHS
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=remaining, eta_min=1e-6
-            )
-
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, args.device)
         val_loss, val_acc, val_f1, val_auc, val_labels, val_preds = validate(model, val_loader, criterion, args.device)
 
-        # Only step cosine scheduler during Stage 2
-        if epoch > WARMUP_FREEZE_EPOCHS:
-            scheduler.step()
+        scheduler.step()
         
         print(f"Epoch {epoch}/{args.epochs}: "
               f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
