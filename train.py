@@ -67,12 +67,36 @@ class BrainTumorSliceDataset(torch.utils.data.Dataset):
             
         return image, label
 
-# Custom transforms that support tensors directly
+# ── Custom transforms (operate on float tensors before Normalize) ─────────────
+
+# ImageNet statistics used by all pretrained torchvision models.
+# MUST be the LAST transform applied to training images, and the ONLY
+# transform applied to validation images.
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
 class RandomAddNoise:
-    def __init__(self, std=0.05):
+    """Additive Gaussian noise — simulates MRI acquisition noise."""
+    def __init__(self, std=0.03):
         self.std = std
     def __call__(self, tensor):
         return tensor + torch.randn_like(tensor) * self.std
+
+
+class RandomBiasField:
+    """
+    Simulates MRI bias field (smooth low-frequency intensity inhomogeneity).
+    Multiplies each channel by a random scalar in [1-strength, 1+strength].
+    This is the lightweight approximation of the spatial bias field artefact.
+    """
+    def __init__(self, strength=0.15):
+        self.strength = strength
+    def __call__(self, tensor):
+        # Independent per-channel multiplicative factor
+        factors = 1.0 + (torch.rand(tensor.shape[0], 1, 1) * 2 - 1) * self.strength
+        return tensor * factors
+
 
 class RandomModalityReplicate:
     """
@@ -179,18 +203,42 @@ def main():
     
     print(f"Fold {args.fold}: Training on {len(train_patients)} patients, validating on {len(val_patients)} patients")
     
-    # Transform definitions
+    # ── Transform definitions ──────────────────────────────────────────────────
+    # IMPORTANT: Order matters.
+    #   1. Geometric augmentations (flip, rotate) — applied to spatial layout.
+    #   2. Intensity augmentations (blur, noise, bias field) — applied to values.
+    #   3. RandomErasing — drops patches to force the model not to rely on them.
+    #   4. RandomModalityReplicate — helps generalize to external single-sequence data.
+    #   5. T.Normalize(ImageNet) — MUST be LAST; backbone expects this range.
+    #
+    # NOTE: T.ColorJitter was removed. It expects uint8 or values in [0,1] before
+    #       normalization. Its effect is covered by RandomBiasField + RandomAddNoise,
+    #       which are MRI-appropriate equivalents.
     train_transform = T.Compose([
+        # --- Geometric ---
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-        T.RandomRotation(degrees=15),
-        T.ColorJitter(brightness=0.15, contrast=0.15),
+        T.RandomRotation(degrees=20, interpolation=T.InterpolationMode.BILINEAR),
+        # --- Intensity / MRI-specific ---
+        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.3),
+        RandomBiasField(strength=0.15),
+        RandomAddNoise(std=0.03),
+        # --- Structural dropout ---
+        T.RandomErasing(p=0.2, scale=(0.02, 0.10), ratio=(0.3, 3.3), value=0),
+        # --- Modality simulation ---
         RandomModalityReplicate(p=0.3),
+        # --- ImageNet normalization (MUST be last) ---
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
-    
+
+    # Validation: only normalize — no augmentation.
+    val_transform = T.Compose([
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
     # Create datasets
     train_dataset = BrainTumorSliceDataset(train_patients, processed_dir, transform=train_transform)
-    val_dataset = BrainTumorSliceDataset(val_patients, processed_dir, transform=None)
+    val_dataset   = BrainTumorSliceDataset(val_patients,   processed_dir, transform=val_transform)
     
     if args.quick:
         print("--> Quick mode active: subsetting datasets for fast test run.")
@@ -219,14 +267,41 @@ def main():
     print(f"Calculated class weights: {class_weights}")
     
     weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-    
+    # label_smoothing=0.1 prevents overconfident predictions and improves calibration.
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=0.1)
+
     # Initialize model
     model = get_model(num_classes=4, pretrained=True).to(args.device)
-    
-    # Optimizer and Scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # ── Two-Stage Fine-Tuning with LLRD ───────────────────────────────────────
+    # Stage 1 (epochs 1..WARMUP_FREEZE_EPOCHS):
+    #   Backbone is FROZEN. Only the new classification head is trained at a
+    #   high LR (1e-3). This lets the head stabilize before the pretrained
+    #   backbone weights are touched.
+    #
+    # Stage 2 (epochs WARMUP_FREEZE_EPOCHS+1..end):
+    #   All layers are unfrozen with LLRD:
+    #     - Head:   args.lr        (highest — newly initialized)
+    #     - layer4: 0.1  × args.lr (fine-tune last residual block)
+    #     - layer3: 0.05 × args.lr
+    #     - layer2: 0.02 × args.lr
+    #     - stem:   0.01 × args.lr (preserve early feature detectors)
+    WARMUP_FREEZE_EPOCHS = 5
+
+    # Start with backbone frozen
+    for name, param in model.named_parameters():
+        if 'fc' not in name:
+            param.requires_grad = False
+
+    head_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(head_params, lr=1e-3, weight_decay=1e-4)
+
+    # Cosine annealing over the full training run (restarts are handled by the epoch logic)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - WARMUP_FREEZE_EPOCHS, eta_min=1e-6
+    )
+
+    print(f"Stage 1: Training head only for {WARMUP_FREEZE_EPOCHS} epochs (backbone frozen).")
     
     # Optional W&B logger setup
     if args.wandb:
@@ -245,10 +320,25 @@ def main():
     best_val_f1 = 0.0
     
     for epoch in range(1, args.epochs + 1):
+        # ── Stage transition: unfreeze backbone at epoch WARMUP_FREEZE_EPOCHS+1 ──
+        if epoch == WARMUP_FREEZE_EPOCHS + 1:
+            print(f"\nStage 2: Unfreezing all layers with LLRD (base_lr={args.lr}).")
+            for param in model.parameters():
+                param.requires_grad = True
+            param_groups = model.get_parameter_groups(base_lr=args.lr)
+            optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+            # Re-initialise scheduler for the remaining epochs
+            remaining = args.epochs - WARMUP_FREEZE_EPOCHS
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining, eta_min=1e-6
+            )
+
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, args.device)
         val_loss, val_acc, val_f1, val_auc, val_labels, val_preds = validate(model, val_loader, criterion, args.device)
-        
-        scheduler.step()
+
+        # Only step cosine scheduler during Stage 2
+        if epoch > WARMUP_FREEZE_EPOCHS:
+            scheduler.step()
         
         print(f"Epoch {epoch}/{args.epochs}: "
               f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
