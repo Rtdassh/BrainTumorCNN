@@ -32,3 +32,11 @@ Thumbs.db
 # IDE configurations
 .vscode/
 .idea/
+analysis_results/accuracy_vs_confidence.png
+analysis_results/confidence_distributions.png
+analysis_results/accuracy_vs_confidence.png
+analysis_results/center_performance.png
+analysis_results/confusion_matrix_detailed.png
+analysis_results/gradcam_saliency.png
+analysis_results/patient_analysis_report.txt
+analysis_results/per_class_metrics.png

@@ -450,22 +450,39 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
     print(f"Total validation slices: {len(val_dataset)}")
     
-    class_names = ["Healthy/Bg", "Edema", "Non-Enhancing Tumor", "Enhancing Tumor"]
-    
-    # Load Model
-    model = get_model(num_classes=4, pretrained=False).to(args.device)
+    # Inspect and load Model
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    print(f"Loaded best checkpoint (Epoch {checkpoint.get('epoch', 'N/A')}, Val F1: {checkpoint.get('val_f1', 0.0):.4f})")
+    state_dict = checkpoint['model_state_dict']
     
+    conv1_w = state_dict.get("model.conv1.weight", state_dict.get("conv1.weight", None))
+    in_channels = conv1_w.shape[1] if conv1_w is not None else 4
+    
+    if "model.fc.weight" in state_dict:
+        num_classes = state_dict["model.fc.weight"].shape[0]
+        use_mlp_head = False
+    elif "fc.weight" in state_dict:
+        num_classes = state_dict["fc.weight"].shape[0]
+        use_mlp_head = False
+    else:
+        head_w = state_dict.get("head.4.weight", state_dict.get("model.fc.3.weight", None))
+        num_classes = head_w.shape[0] if head_w is not None else 3
+        use_mlp_head = True
+
+    is_multilabel = (num_classes == 3)
+    class_names = ["Edema", "Non-Enhancing Core", "Enhancing Core"] if is_multilabel else ["Healthy/Bg", "Edema", "Non-Enhancing", "Enhancing"]
+
+    model = get_model(num_classes=num_classes, in_channels=in_channels, pretrained=False, use_mlp_head=use_mlp_head).to(args.device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    print(f"Loaded checkpoint (Epoch {checkpoint.get('epoch', 'N/A')}, Val F1: {checkpoint.get('val_f1', 0.0):.4f})")
+    print(f"Model Configuration: in_channels={in_channels}, num_classes={num_classes}, is_multilabel={is_multilabel}")
+
     # Run Inference
     all_preds = []
     all_labels = []
     all_probs = []
     all_patient_ids = []
     
-    # Save patient slice indices mapping
     for idx, (img_path, label) in enumerate(val_dataset.samples):
         p_id = os.path.basename(img_path).split("_slice_")[0]
         all_patient_ids.append(p_id)
@@ -473,18 +490,52 @@ def main():
     print("Running validation inference...")
     with torch.no_grad():
         for images, labels in tqdm(val_loader, desc="Inference"):
+            if in_channels == 3 and images.shape[1] == 4:
+                images = images[:, [0, 2, 3]]
             images = images.to(args.device)
+            
             outputs = model(images)
-            probs = torch.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
+            if is_multilabel:
+                probs = torch.sigmoid(outputs)
+                preds = (probs >= 0.5).float()
+            else:
+                probs = torch.softmax(outputs, dim=1)
+                _, preds = torch.max(outputs, 1)
+                
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(labels.numpy())
+            all_probs.append(probs.cpu().numpy())
             
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-            
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
+    all_preds = np.vstack(all_preds) if is_multilabel else np.concatenate(all_preds)
+    all_labels = np.vstack(all_labels) if len(all_labels[0].shape) > 0 else np.concatenate(all_labels)
+    all_probs = np.vstack(all_probs)
+    
+    # Harmonize label format with model output type
+    if not is_multilabel and len(all_labels.shape) > 1 and all_labels.shape[1] == 3:
+        true_scalar = []
+        for vec in all_labels:
+            if vec[2] == 1:
+                true_scalar.append(3) # Enhancing
+            elif vec[1] == 1:
+                true_scalar.append(2) # Non-enhancing
+            elif vec[0] == 1:
+                true_scalar.append(1) # Edema
+            else:
+                true_scalar.append(0) # Healthy/Bg
+        all_labels = np.array(true_scalar)
+    elif is_multilabel and len(all_labels.shape) == 1:
+        true_vec = []
+        for cls in all_labels:
+            if cls == 3:
+                true_vec.append([0, 0, 1])
+            elif cls == 2:
+                true_vec.append([0, 1, 0])
+            elif cls == 1:
+                true_vec.append([1, 0, 0])
+            else:
+                true_vec.append([0, 0, 0])
+        all_labels = np.array(true_vec)
+
     
     # ------------------ SLICE LEVEL ANALYTICS ------------------
     print("\n--- Generating Slice-Level Visualizations ---")
@@ -661,12 +712,13 @@ def main():
         f.write(f"  - Patient-Level Macro F1: {pat_max_f1:.4f}\n\n")
         
         f.write("Patient-Level Classification Report (Average Probabilities):\n")
-        f.write(classification_report(patient_true, patient_pred_prob, target_names=class_names, zero_division=0))
+        f.write(classification_report(patient_true, patient_pred_prob, target_names=class_names, labels=list(range(len(class_names))), zero_division=0))
         f.write("\n")
         
         f.write("Patient-Level Classification Report (Maximum Severity):\n")
-        f.write(classification_report(patient_true, patient_pred_max, target_names=class_names, zero_division=0))
+        f.write(classification_report(patient_true, patient_pred_max, target_names=class_names, labels=list(range(len(class_names))), zero_division=0))
         f.write("\n")
+
         
         f.write("----------------------------------------------------------------------\n")
         f.write(" 3. CLINICAL SUBPOPULATION ANALYSIS (COHORT BIAS / ROBUSTNESS)\n")
