@@ -18,12 +18,12 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
     
     print(f"Found {len(image_paths)} images and {len(label_paths)} labels.")
     
-    # Create output directories
+    # Create output directories for organizing slice files
     for i in range(4):
         os.makedirs(os.path.join(output_dir, f"class_{i}"), exist_ok=True)
         
-    slice_counts = {i: 0 for i in range(4)}
     patient_metadata = {}
+    label_counts = {"edema": 0, "non_enhancing": 0, "enhancing": 0, "healthy": 0}
 
     for img_path, lbl_path in tqdm(zip(image_paths, label_paths), total=len(image_paths)):
         patient_id = os.path.basename(img_path).replace(".nii.gz", "")
@@ -32,38 +32,35 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
         img_nii = nib.load(img_path)
         lbl_nii = nib.load(lbl_path)
         
-        # Load only label data as it is much smaller
         lbl_data = np.asanyarray(lbl_nii.dataobj) # Shape: (H, W, D)
-        
         h, w, d = lbl_data.shape
         
-        # We will keep track of slices saved for this patient to limit count
-        saved_classes = {i: [] for i in range(4)}
+        patient_slices = []
+        saved_classes = {i: 0 for i in range(4)}
         
-        # Determine slices we need to extract for this patient
+        # Determine slice indices to extract for this patient
         needed_slices = {}
         for z in range(0, d, step):
             lbl_slice = lbl_data[:, :, z]
             
+            # Determine primary class for storage categorization
             if np.any(lbl_slice == 3):
-                cls = 3
+                primary_cls = 3
             elif np.any(lbl_slice == 2):
-                cls = 2
+                primary_cls = 2
             elif np.any(lbl_slice == 1):
-                cls = 1
+                primary_cls = 1
             else:
-                cls = 0
+                primary_cls = 0
                 
-            # If we haven't reached the limit for this class, plan to extract it
-            if len(saved_classes[cls]) + len(needed_slices.get(cls, [])) < max_slices_per_class:
-                needed_slices.setdefault(cls, []).append(z)
+            if saved_classes[primary_cls] + len(needed_slices.get(primary_cls, [])) < max_slices_per_class:
+                needed_slices.setdefault(primary_cls, []).append(z)
                 
-        # If we need any slices from this patient, load image once into memory as float32
         if any(len(indices) > 0 for indices in needed_slices.values()):
-            img_data = img_nii.get_fdata(dtype=np.float32) # Decompress once in memory (fast!)
+            img_data = img_nii.get_fdata(dtype=np.float32) # Decompress 4D volume once in memory: (H, W, D, 4)
             
-            # Normalize the 3D volume per modality/channel to preserve relative contrast across slices
-            for mod_idx in [0, 2, 3]:
+            # Normalize all 4 3D modalities per volume independently: FLAIR (0), T1w (1), T1gd (2), T2w (3)
+            for mod_idx in range(4):
                 vol = img_data[:, :, :, mod_idx]
                 vol_min, vol_max = vol.min(), vol.max()
                 if vol_max > vol_min:
@@ -71,33 +68,47 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
                 else:
                     img_data[:, :, :, mod_idx] = 0.0
             
-            for cls, z_indices in needed_slices.items():
+            for primary_cls, z_indices in needed_slices.items():
                 for z in z_indices:
-                    img_slice = img_data[:, :, z, :]
+                    img_slice = img_data[:, :, z, :] # Shape: (H, W, 4)
+                    lbl_slice = lbl_data[:, :, z]    # Shape: (H, W)
                     
-                    # Check if there is brain tissue (non-zero background)
-                    # FLAIR is modality 0
+                    # Check if brain tissue is present (FLAIR is modality 0)
                     flair_slice = img_slice[:, :, 0]
                     if flair_slice.max() == 0 or (flair_slice > flair_slice.mean()).sum() < 500:
-                        continue # Skip slices with almost no brain tissue
+                        continue
                         
-                    # Prepare 3-channel input: FLAIR (0), T1gd (2), T2w (3)
-                    # Since volume is already normalized, we extract channels directly
-                    channels = [img_slice[:, :, mod_idx] for mod_idx in [0, 2, 3]]
+                    # Stack ALL 4 modalities: FLAIR (0), T1w (1), T1gd (2), T2w (3) -> (4, H, W)
+                    slice_4ch = np.stack([img_slice[:, :, mod] for mod in range(4)], axis=0).astype(np.float32)
+                    
+                    # Compute multi-label binary indicators: [has_edema, has_non_enhancing, has_enhancing]
+                    has_edema = int(np.any(lbl_slice == 1))
+                    has_non_enhancing = int(np.any(lbl_slice == 2))
+                    has_enhancing = int(np.any(lbl_slice == 3))
+                    labels_vec = [has_edema, has_non_enhancing, has_enhancing]
+                    
+                    if sum(labels_vec) == 0:
+                        label_counts["healthy"] += 1
+                    else:
+                        if has_edema: label_counts["edema"] += 1
+                        if has_non_enhancing: label_counts["non_enhancing"] += 1
+                        if has_enhancing: label_counts["enhancing"] += 1
                         
-                    # Stack to form (3, H, W)
-                    slice_3ch = np.stack(channels, axis=0).astype(np.float32)
+                    # Save slice as .npy file
+                    rel_path = os.path.join(f"class_{primary_cls}", f"{patient_id}_slice_{z}.npy")
+                    full_path = os.path.join(output_dir, rel_path)
+                    np.save(full_path, slice_4ch)
                     
-                    # Save slice as .npy
-                    filename = f"{patient_id}_slice_{z}.npy"
-                    filepath = os.path.join(output_dir, f"class_{cls}", filename)
-                    np.save(filepath, slice_3ch)
-                    
-                    saved_classes[cls].append(z)
-                    slice_counts[cls] += 1
+                    patient_slices.append({
+                        "z": z,
+                        "rel_path": rel_path,
+                        "labels": labels_vec,
+                        "primary_class": primary_cls
+                    })
+                    saved_classes[primary_cls] += 1
                 
         patient_metadata[patient_id] = {
-            "slices": {cls: saved_classes[cls] for cls in range(4)}
+            "slices": patient_slices
         }
         
     # Save metadata
@@ -105,9 +116,10 @@ def preprocess_dataset(max_slices_per_class=5, step=2):
         json.dump(patient_metadata, f, indent=4)
         
     print("\nPreprocessing complete!")
-    print("Slice counts by class:")
-    for cls, count in slice_counts.items():
-        print(f"  Class {cls}: {count} slices")
+    print("Multi-label occurrences across saved slices:")
+    for label_name, count in label_counts.items():
+        print(f"  {label_name.capitalize()}: {count} occurrences")
         
 if __name__ == "__main__":
     preprocess_dataset(max_slices_per_class=5, step=2)
+

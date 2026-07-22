@@ -14,7 +14,7 @@ from sklearn.metrics import classification_report, f1_score, roc_auc_score
 from model import get_model
 from crossval import get_patient_folds
 
-# Custom Dataset
+# Custom Dataset for Multi-Label 4-Channel Slices
 class BrainTumorSliceDataset(torch.utils.data.Dataset):
     def __init__(self, patient_list, processed_dir, transform=None, cache=True, image_size=128):
         self.processed_dir = processed_dir
@@ -29,20 +29,20 @@ class BrainTumorSliceDataset(torch.utils.data.Dataset):
             
         for p_id in patient_list:
             if p_id in metadata:
-                slices = metadata[p_id]["slices"]
-                for cls_str, slice_list in slices.items():
-                    cls = int(cls_str)
-                    for z in slice_list:
-                        slice_path = os.path.join(processed_dir, f"class_{cls}", f"{p_id}_slice_{z}.npy")
-                        if os.path.exists(slice_path):
-                            self.samples.append((slice_path, cls))
+                slice_list = metadata[p_id]["slices"]
+                for item in slice_list:
+                    slice_rel_path = item["rel_path"]
+                    labels_vec = item["labels"] # [has_edema, has_non_enhancing, has_enhancing]
+                    slice_path = os.path.join(processed_dir, slice_rel_path)
+                    if os.path.exists(slice_path):
+                        self.samples.append((slice_path, labels_vec))
                             
         # Cache samples in memory if enabled
         if self.cache:
-            print(f"Caching {len(self.samples)} samples in memory (resized to {self.image_size}x{self.image_size})...")
+            print(f"Caching {len(self.samples)} 4-channel samples in memory (resized to {self.image_size}x{self.image_size})...")
             self.cached_images = []
             for slice_path, _ in tqdm(self.samples, desc="Caching dataset", leave=False):
-                image = np.load(slice_path)
+                image = np.load(slice_path) # Shape: (4, H, W)
                 image_tensor = torch.tensor(image, dtype=torch.float32)
                 if self.image_size is not None:
                     image_tensor = TF.resize(image_tensor, [self.image_size, self.image_size])
@@ -52,10 +52,10 @@ class BrainTumorSliceDataset(torch.utils.data.Dataset):
         return len(self.samples)
         
     def __getitem__(self, idx):
-        slice_path, label = self.samples[idx]
+        slice_path, label_vec = self.samples[idx]
         
         if self.cache:
-            image = self.cached_images[idx].clone() # Clone to avoid modifying cache in-place
+            image = self.cached_images[idx].clone()
         else:
             image = np.load(slice_path)
             image = torch.tensor(image, dtype=torch.float32)
@@ -65,19 +65,13 @@ class BrainTumorSliceDataset(torch.utils.data.Dataset):
         if self.transform:
             image = self.transform(image)
             
-        return image, label
+        label_tensor = torch.tensor(label_vec, dtype=torch.float32)
+        return image, label_tensor
 
-# ── Custom transforms (operate on float tensors before Normalize) ─────────────
-
-# ImageNet statistics used by all pretrained torchvision models.
-# MUST be the LAST transform applied to training images, and the ONLY
-# transform applied to validation images.
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-
+# ── Custom transforms for 4-channel tensors ─────────────
 
 class RandomAddNoise:
-    """Additive Gaussian noise — simulates MRI acquisition noise."""
+    """Additive Gaussian noise for MRI slices."""
     def __init__(self, std=0.03):
         self.std = std
     def __call__(self, tensor):
@@ -85,31 +79,23 @@ class RandomAddNoise:
 
 
 class RandomBiasField:
-    """
-    Simulates MRI bias field (smooth low-frequency intensity inhomogeneity).
-    Multiplies each channel by a random scalar in [1-strength, 1+strength].
-    This is the lightweight approximation of the spatial bias field artefact.
-    """
+    """Multiplicative bias field simulation across 4 channels."""
     def __init__(self, strength=0.15):
         self.strength = strength
     def __call__(self, tensor):
-        # Independent per-channel multiplicative factor
         factors = 1.0 + (torch.rand(tensor.shape[0], 1, 1) * 2 - 1) * self.strength
         return tensor * factors
 
 
 class RandomModalityReplicate:
-    """
-    Randomly (with probability p) selects one of the 3 channels (FLAIR, T1gd, T2w)
-    and replicates it across all 3 channels to simulate single-channel sequence inputs.
-    This helps the model generalize to single-sequence grayscale images (like external test sets).
-    """
-    def __init__(self, p=0.3):
+    """Randomly replicates 1 of the 4 modalities across all 4 channels."""
+    def __init__(self, p=0.2):
         self.p = p
     def __call__(self, tensor):
         if torch.rand(1).item() < self.p:
-            idx = torch.randint(0, 3, (1,)).item()
-            return tensor[idx:idx+1].repeat(3, 1, 1)
+            num_channels = tensor.shape[0]
+            idx = torch.randint(0, num_channels, (1,)).item()
+            return tensor[idx:idx+1].repeat(num_channels, 1, 1)
         return tensor
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -129,12 +115,16 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
         
         running_loss += loss.item() * images.size(0)
-        _, preds = torch.max(outputs, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+        probs = torch.sigmoid(outputs)
+        preds = (probs >= 0.5).float()
+        
+        all_preds.append(preds.detach().cpu().numpy())
+        all_labels.append(labels.detach().cpu().numpy())
         
     epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+    all_preds = np.vstack(all_preds)
+    all_labels = np.vstack(all_labels)
+    epoch_acc = np.mean(all_preds == all_labels)
     return epoch_loss, epoch_acc
 
 @torch.no_grad()
@@ -153,29 +143,30 @@ def validate(model, loader, criterion, device):
         loss = criterion(outputs, labels)
         
         running_loss += loss.item() * images.size(0)
-        probs = torch.softmax(outputs, dim=1)
-        _, preds = torch.max(outputs, 1)
+        probs = torch.sigmoid(outputs)
+        preds = (probs >= 0.5).float()
         
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
+        all_preds.append(preds.cpu().numpy())
+        all_labels.append(labels.cpu().numpy())
+        all_probs.append(probs.cpu().numpy())
         
     val_loss = running_loss / len(loader.dataset)
-    val_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+    all_preds = np.vstack(all_preds)
+    all_labels = np.vstack(all_labels)
+    all_probs = np.vstack(all_probs)
     
-    # Calculate macro F1
-    val_f1 = f1_score(all_labels, all_preds, average='macro')
+    val_acc = np.mean(all_preds == all_labels)
+    val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     
-    # Calculate AUC
     try:
-        val_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr')
+        val_auc = roc_auc_score(all_labels, all_probs, average='macro')
     except Exception:
         val_auc = 0.0
         
     return val_loss, val_acc, val_f1, val_auc, all_labels, all_preds
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ResNet-18 on Brain Tumor Slices")
+    parser = argparse.ArgumentParser(description="Train 4-Channel Multi-Label Model on Brain Tumor Slices")
     parser.add_argument("--fold", type=int, default=1, help="Which fold to train (1-5)")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
@@ -187,7 +178,6 @@ def main():
     
     print(f"Using device: {args.device}")
     
-    # Define directories
     base_dir = os.path.dirname(os.path.abspath(__file__))
     processed_dir = os.path.join(base_dir, "data", "processed_2d")
     checkpoint_dir = os.path.join(base_dir, "checkpoints")
@@ -197,38 +187,20 @@ def main():
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Processed dataset metadata not found at {metadata_path}. Please run preprocess_data.py first.")
         
-    # Get patient splits for cross validation
     folds = get_patient_folds(metadata_path, n_splits=5)
     train_patients, val_patients = folds[args.fold - 1]
     
     print(f"Fold {args.fold}: Training on {len(train_patients)} patients, validating on {len(val_patients)} patients")
     
-    # ── Transform definitions ──────────────────────────────────────────────────
-    # IMPORTANT: Order matters.
-    #   1. Geometric augmentations (flip, rotate) — applied to spatial layout.
-    #   2. Intensity augmentations (blur, noise, bias field) — applied to values.
-    #   3. RandomErasing — drops patches to force the model not to rely on them.
-    #   4. RandomModalityReplicate — helps generalize to external single-sequence data.
-    #   5. T.Normalize(ImageNet) — MUST be LAST; backbone expects this range.
-    #
-    # NOTE: T.ColorJitter was removed. It expects uint8 or values in [0,1] before
-    #       normalization. Its effect is covered by RandomBiasField + RandomAddNoise,
-    #       which are MRI-appropriate equivalents.
     train_transform = T.Compose([
-        # --- Geometric ---
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
         T.RandomRotation(degrees=15, interpolation=T.InterpolationMode.BILINEAR),
-        # --- Modality simulation ---
-        RandomModalityReplicate(p=0.3),
-        # NOTE: ImageNet Normalization removed. It shifts the 0-background to -2.11,
-        # creating artificial boundaries when ResNet applies zero-padding.
+        RandomModalityReplicate(p=0.2),
     ])
 
-    # Validation: no augmentation.
     val_transform = None
 
-    # Create datasets
     train_dataset = BrainTumorSliceDataset(train_patients, processed_dir, transform=train_transform)
     val_dataset   = BrainTumorSliceDataset(val_patients,   processed_dir, transform=val_transform)
     
@@ -239,46 +211,32 @@ def main():
         
     print(f"Dataset sizes: Train = {len(train_dataset)} slices, Val = {len(val_dataset)} slices")
     
-    # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     
-    # Compute class weights to handle class imbalance
-    class_counts = [0] * 4
-    for _, label in train_dataset.samples:
-        class_counts[label] += 1
-    total_samples = sum(class_counts)
+    # Calculate positive weights per label for BCEWithLogitsLoss
+    all_train_labels = np.array([label_vec for _, label_vec in train_dataset.samples])
+    pos_counts = all_train_labels.sum(axis=0)
+    neg_counts = len(all_train_labels) - pos_counts
+    pos_weights = np.where(pos_counts > 0, neg_counts / pos_counts, 1.0)
     
-    # Weighted Cross Entropy weights = total / (num_classes * class_count)
-    class_weights = []
-    for count in class_counts:
-        weight = total_samples / (4.0 * count) if count > 0 else 1.0
-        class_weights.append(weight)
-        
-    print(f"Class counts in training set: {class_counts}")
-    print(f"Calculated class weights: {class_weights}")
+    print(f"Positive counts per label [Edema, Non-Enhancing, Enhancing]: {pos_counts}")
+    print(f"BCE positive weights: {pos_weights}")
     
-    weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
-    # Reverted label_smoothing.
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+    pos_weight_tensor = torch.tensor(pos_weights, dtype=torch.float32).to(args.device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 
-    # Initialize model
-    model = get_model(num_classes=4, pretrained=True).to(args.device)
+    # Initialize 4-channel model with 3-class multi-label output
+    model = get_model(num_classes=3, in_channels=4, pretrained=True).to(args.device)
 
-    # ── Optimizer and Scheduler ───────────────────────────────────────────────
-    # We use a single learning rate for the whole model.
-    # Since MRI modalities (FLAIR, T1gd, T2w) are very different from RGB 
-    # natural images, the early layers (stem) MUST be able to adapt their 
-    # weights significantly. Freezing them hurts transfer learning for MRIs.
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
-    # Optional W&B logger setup
     if args.wandb:
         import wandb
         wandb.init(
             project="brain-tumor-cnn",
-            name=f"resnet18-fold-{args.fold}",
+            name=f"resnet18-multilabel-fold-{args.fold}",
             config={
                 "learning_rate": args.lr,
                 "epochs": args.epochs,
@@ -311,7 +269,6 @@ def main():
                 "lr": optimizer.param_groups[0]["lr"]
             })
             
-        # Save best checkpoint
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             checkpoint_path = os.path.join(checkpoint_dir, f"best_model_fold_{args.fold}.pth")
@@ -327,6 +284,7 @@ def main():
     print(f"\nTraining for Fold {args.fold} finished. Best Val F1: {best_val_f1:.4f}")
     if args.wandb:
         wandb.finish()
+
         
 if __name__ == "__main__":
     main()

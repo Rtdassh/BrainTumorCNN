@@ -11,11 +11,11 @@ from train import BrainTumorSliceDataset
 class TestBrainTumorCNN(unittest.TestCase):
     
     def test_model_architecture(self):
-        """Test if the modified ResNet-18 model compiles and returns correct output shapes."""
-        model = get_model(num_classes=4, pretrained=False)
-        dummy_input = torch.randn(2, 3, 240, 240)
+        """Test if the 4-channel multi-label ResNet-18 model compiles and returns correct output shapes."""
+        model = get_model(num_classes=3, in_channels=4, pretrained=False)
+        dummy_input = torch.randn(2, 4, 240, 240)
         output = model(dummy_input)
-        self.assertEqual(output.shape, (2, 4))
+        self.assertEqual(output.shape, (2, 3))
         
     def test_cross_validation_leakage(self):
         """Verify that patient-level K-fold has no leakage (no intersection between train and val)."""
@@ -37,7 +37,7 @@ class TestBrainTumorCNN(unittest.TestCase):
             print("Skipping cross-validation test (metadata.json not generated yet).")
             
     def test_dataset_loading(self):
-        """Verify dataset loader handles shape loading correctly."""
+        """Verify dataset loader handles 4-channel shapes and 3-class target vectors correctly."""
         base_dir = os.path.dirname(os.path.abspath(__file__))
         processed_dir = os.path.join(base_dir, "data", "processed_2d")
         metadata_path = os.path.join(processed_dir, "metadata.json")
@@ -51,8 +51,8 @@ class TestBrainTumorCNN(unittest.TestCase):
             
             if len(dataset) > 0:
                 img, label = dataset[0]
-                self.assertEqual(img.shape[0], 3) # Should have 3 channels
-                self.assertTrue(0 <= label <= 3) # Class label must be in range
+                self.assertEqual(img.shape[0], 4) # Should have 4 channels (FLAIR, T1w, T1gd, T2w)
+                self.assertEqual(label.shape[0], 3) # Target vector should have 3 binary indicators
             else:
                 print("Dataset contains no slices for the selected patients.")
         else:
@@ -60,3 +60,4 @@ class TestBrainTumorCNN(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

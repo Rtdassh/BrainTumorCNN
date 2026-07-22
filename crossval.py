@@ -20,10 +20,15 @@ def get_patient_folds(metadata_path, n_splits=5, random_state=42):
     for p_id in patient_ids:
         slices = metadata[p_id]["slices"]
         max_class = 0
-        for cls in range(4):
-            if len(slices[str(cls)]) > 0:
-                max_class = max(max_class, cls)
+        if isinstance(slices, list):
+            for item in slices:
+                max_class = max(max_class, item.get("primary_class", 0))
+        elif isinstance(slices, dict):
+            for cls in range(4):
+                if str(cls) in slices and len(slices[str(cls)]) > 0:
+                    max_class = max(max_class, cls)
         patient_labels.append(max_class)
+
         
     patient_ids = np.array(patient_ids)
     patient_labels = np.array(patient_labels)
